@@ -12124,6 +12124,19 @@ const PRIOR_STATE = {
     },
     "unlinked": [],
     "shared_files": {}
+  },
+  "vinyard_charley": {
+    "last_saved": "2026-03-18T18:59:50.104Z",
+    "bins": {
+      "1": {
+        "label": "Song 1",
+        "file_ids": [
+          "1YnNDWTV9i-hL9wQ_WvlNFFlk2wCTMHX_"
+        ]
+      }
+    },
+    "unlinked": [],
+    "shared_files": {}
   }
 };
 
@@ -12198,6 +12211,10 @@ const NAME_MAP = {
    Falls back to baked-in STUDENT_DATA if fetch fails. */
 const PUBLISHED_CSV_URL = "https://docs.google.com/spreadsheets/d/1TlqCntojnDXWPobjajrj3uHhYCI4fNXxGReC4DtGNq0/gviz/tq?headers=1&tqx=responseHandler:_onLiveData";
 
+/* Published form responses CSV — if set, loadPriorState() fetches live saves.
+   Falls back to baked-in PRIOR_STATE if fetch fails. */
+const RESPONSES_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRs2x1-_DTlRVkp-LQZhPNABgBrGPucZv9Ao65a7lEO3ZeUilXmz4G23Wj7MK10Vf-hIgpYtxWwxQfb/pub?gid=1092930835&single=true&output=csv";
+
 const FORM_POST_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdjF7FfmK7R6NfDj_i6SEgx2elo63B-pSY8P3F_jQTDp-zgyw/formResponse";
 const FORM_FIELD_ID = "entry.341276561";
 const DATA_AS_OF = "Mar 17, 2026";  // Most recent scrape date — replaced by export script
@@ -12224,25 +12241,107 @@ async function loadStudentData(classId, studentId) {
   return classData.students[studentId] || null;
 }
 
+/* Live responses cache — fetched once on first loadPriorState call */
+let _liveResponses = null;       // null = not fetched, {} = fetched (may be empty)
+let _liveResponsesSource = null; // "live", "baked", or null
+
+async function _fetchLiveResponses() {
+  if (_liveResponses !== null) return;  // Already fetched
+  if (!RESPONSES_CSV_URL || window.location.protocol === 'file:') {
+    _liveResponses = {};
+    _liveResponsesSource = "baked";
+    return;
+  }
+  try {
+    const resp = await fetch(RESPONSES_CSV_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const csvText = await resp.text();
+    _liveResponses = _parseResponsesCSV(csvText);
+    _liveResponsesSource = "live";
+    console.log(`Loaded live responses for ${Object.keys(_liveResponses).length} students`);
+  } catch (e) {
+    console.warn('Live responses fetch failed, using baked-in:', e);
+    _liveResponses = {};
+    _liveResponsesSource = "baked";
+  }
+}
+
+function _parseResponsesCSV(csvText) {
+  /* Parse the published form responses CSV.
+     Columns: Timestamp, [form field with JSON payload]
+     Keep most recent submission per student_id. */
+  const lines = csvText.split('\n');
+  if (lines.length < 2) return {};
+
+  const state = {};
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    // Find JSON payload in the row (skip the Timestamp column)
+    const jsonMatch = line.match(/\{[^}]*"student_id"[^}]*\}/);
+    if (!jsonMatch) {
+      // Try for multi-line or complex JSON — look for first { after comma
+      const commaIdx = line.indexOf(',');
+      if (commaIdx < 0) continue;
+      let jsonStr = line.substring(commaIdx + 1).trim();
+      // Strip surrounding quotes if CSV-escaped
+      if (jsonStr.startsWith('"') && jsonStr.endsWith('"')) {
+        jsonStr = jsonStr.slice(1, -1).replace(/""/g, '"');
+      }
+      try {
+        const payload = JSON.parse(jsonStr);
+        _processResponsePayload(payload, state);
+      } catch (e) { continue; }
+    } else {
+      try {
+        const payload = JSON.parse(jsonMatch[0]);
+        _processResponsePayload(payload, state);
+      } catch (e) { continue; }
+    }
+  }
+  return state;
+}
+
+function _processResponsePayload(payload, state) {
+  const studentId = payload.student_id;
+  const timestamp = payload.timestamp || '';
+  if (!studentId) return;
+
+  const existing = state[studentId];
+  if (existing && existing.last_saved >= timestamp) return;
+
+  state[studentId] = {
+    last_saved: timestamp,
+    bins: payload.bins || {},
+    unlinked: payload.unlinked || [],
+    shared_files: payload.shared_files || {},
+  };
+}
+
 /**
  * Load prior bin assignments for a student.
- * Priority: localStorage (most recent local save) → baked-in PRIOR_STATE (from last export).
+ * Priority: localStorage → live responses (if hosted) → baked-in PRIOR_STATE.
  *
  * @param {string} studentId
  * @returns {Object|null} Prior state object or null if no prior save.
  */
 async function loadPriorState(studentId) {
+  // Ensure live responses are fetched
+  await _fetchLiveResponses();
+
   // Check localStorage first — has the student saved in this browser since last export?
   try {
     const localKey = `linkage_${studentId}`;
     const localData = localStorage.getItem(localKey);
     if (localData) {
       const parsed = JSON.parse(localData);
+      // Compare against both live and baked-in
+      const live = _liveResponses[studentId];
       const bakedIn = PRIOR_STATE[studentId];
-      // Use local version if it's newer than baked-in (or if no baked-in exists)
-      if (!bakedIn || !bakedIn.last_saved || parsed.timestamp > bakedIn.last_saved) {
+      const bestServer = live || bakedIn;
+      if (!bestServer || !bestServer.last_saved || parsed.timestamp > bestServer.last_saved) {
         console.log(`Loaded state from localStorage for ${studentId} (saved ${parsed.timestamp})`);
-        // Convert localStorage format to match PRIOR_STATE structure
         return {
           last_saved: parsed.timestamp,
           bins: parsed.bins,
@@ -12252,9 +12351,16 @@ async function loadPriorState(studentId) {
       }
     }
   } catch (e) {
-    console.warn("localStorage read failed, falling back to baked-in state:", e);
+    console.warn("localStorage read failed:", e);
   }
 
+  // Try live responses
+  if (_liveResponses[studentId]) {
+    console.log(`Loaded state from live responses for ${studentId}`);
+    return _liveResponses[studentId];
+  }
+
+  // Fall back to baked-in
   return PRIOR_STATE[studentId] || null;
 }
 
@@ -13541,10 +13647,13 @@ function _onLiveDataFailed() {
   _finishStartup();
 }
 
-function showDataSource(isLive) {
+function showDataSource(dataLive, savesLive) {
   const badge = document.getElementById('data-source-badge');
-  if (isLive) {
+  if (dataLive && savesLive) {
     badge.textContent = 'live';
+    badge.className = 'data-source-badge live';
+  } else if (dataLive || savesLive) {
+    badge.textContent = 'partial';
     badge.className = 'data-source-badge live';
   } else {
     badge.textContent = 'offline';
@@ -13555,7 +13664,11 @@ function showDataSource(isLive) {
 function _finishStartup() {
   // Only show the data source badge when hosted (not from file://)
   if (window.location.protocol !== 'file:') {
-    showDataSource(_liveDataLoaded);
+    // Saves source won't be known until first loadPriorState, so update after fetch
+    showDataSource(_liveDataLoaded, false);
+    _fetchLiveResponses().then(() => {
+      showDataSource(_liveDataLoaded, _liveResponsesSource === 'live');
+    });
   }
   initClassDropdown();
   document.getElementById('header-data-date').textContent = `Files as of ${DATA_AS_OF}`;
