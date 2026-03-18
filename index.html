@@ -1047,7 +1047,7 @@ const RESPONSES_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRs2x
 
 const FORM_POST_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdjF7FfmK7R6NfDj_i6SEgx2elo63B-pSY8P3F_jQTDp-zgyw/formResponse";
 const FORM_FIELD_ID = "entry.341276561";
-const DATA_AS_OF = "Mar 17, 2026";  // Most recent scrape date — replaced by export script
+let DATA_AS_OF = "Mar 17, 2026";  // Most recent scrape date — replaced by export script or live JSON
 
 
 /* ==============================================================
@@ -1099,7 +1099,9 @@ async function _fetchLiveResponses() {
 function _parseResponsesCSV(csvText) {
   /* Parse the published form responses CSV.
      Columns: Timestamp, [form field with JSON payload]
-     Keep most recent submission per student_id. */
+     Keep most recent submission per student_id.
+     Google Sheets published CSV escapes internal quotes as "" and
+     wraps fields containing commas/quotes in double-quotes. */
   const lines = csvText.split('\n');
   if (lines.length < 2) return {};
 
@@ -1108,27 +1110,22 @@ function _parseResponsesCSV(csvText) {
     const line = lines[i];
     if (!line.trim()) continue;
 
-    // Find JSON payload in the row (skip the Timestamp column)
-    const jsonMatch = line.match(/\{[^}]*"student_id"[^}]*\}/);
-    if (!jsonMatch) {
-      // Try for multi-line or complex JSON — look for first { after comma
-      const commaIdx = line.indexOf(',');
-      if (commaIdx < 0) continue;
-      let jsonStr = line.substring(commaIdx + 1).trim();
-      // Strip surrounding quotes if CSV-escaped
-      if (jsonStr.startsWith('"') && jsonStr.endsWith('"')) {
-        jsonStr = jsonStr.slice(1, -1).replace(/""/g, '"');
-      }
-      try {
-        const payload = JSON.parse(jsonStr);
-        _processResponsePayload(payload, state);
-      } catch (e) { continue; }
-    } else {
-      try {
-        const payload = JSON.parse(jsonMatch[0]);
-        _processResponsePayload(payload, state);
-      } catch (e) { continue; }
+    // Find the first { — everything from there to end of line is the JSON payload
+    const braceIdx = line.indexOf('{');
+    if (braceIdx < 0) continue;
+
+    let jsonStr = line.substring(braceIdx);
+    // Strip trailing quote if CSV-wrapped (line might end with  ...")
+    if (jsonStr.endsWith('"')) {
+      jsonStr = jsonStr.slice(0, -1);
     }
+    // Unescape CSV double-quote escaping: "" → "
+    jsonStr = jsonStr.replace(/""/g, '"');
+
+    try {
+      const payload = JSON.parse(jsonStr);
+      _processResponsePayload(payload, state);
+    } catch (e) { continue; }
   }
   return state;
 }
@@ -2398,82 +2395,35 @@ function showConfirmDialog(message, onConfirm) {
    SECTION 11: LIVE DATA FETCH (JSONP via Google Visualization API)
    ============================================================== */
 
-// Flag set by JSONP callback when live data arrives
+// Flag set when live data arrives (from JSON fetch or baked-in fallback)
 let _liveDataLoaded = false;
 
-function parseGvizToStudentData(response) {
-  /* Google Visualization API returns:
-     { table: { cols: [{label:...},...], rows: [{c:[{v:...},...]},...] } } */
-  const table = response.table;
-  if (!table || !table.rows || !table.cols) return null;
-
-  // Build column index from labels
-  const col = {};
-  table.cols.forEach((c, i) => col[c.label] = i);
-
-  const data = {};
-  for (const row of table.rows) {
-    const cell = (name) => {
-      const idx = col[name];
-      return (idx !== undefined && row.c[idx]) ? (row.c[idx].v || '') : '';
-    };
-
-    const classId = cell('class_id');
-    const className = cell('class_name');
-    const studentRootId = cell('student_root_id');
-
-    if (!classId || !studentRootId) continue;
-
-    // Resolve via NAME_MAP: student_root_id → {display_name, folder_key}
-    const mapped = NAME_MAP[studentRootId] || {};
-    const folderKey = mapped.folder_key || studentRootId;
-    const displayName = mapped.display_name || cell('obscured_name') || studentRootId;
-
-    if (!data[classId]) {
-      data[classId] = { class_name: className, students: {} };
-    }
-    if (!data[classId].students[folderKey]) {
-      data[classId].students[folderKey] = {
-        display_name: displayName,
-        student_root_id: studentRootId,
-        files: []
-      };
-    }
-
-    data[classId].students[folderKey].files.push({
-      id: cell('file_id'),
-      name: cell('file_name'),
-      path: cell('file_path'),
-      relative_path: cell('relative_path'),
-      checkpoint: cell('checkpoint'),
-      modified: cell('modified'),
-      mime: cell('mime'),
-      ext: cell('ext'),
-      first_seen: cell('first_seen'),
-    });
+async function _fetchLiveData() {
+  /* Fetch portfolio_folder_data.json from the same origin (GitHub Pages).
+     Falls back to baked-in STUDENT_DATA if fetch fails or running from file://. */
+  if (window.location.protocol === 'file:') {
+    _finishStartup();
+    return;
   }
 
-  return Object.keys(data).length > 0 ? data : null;
-}
-
-/* JSONP callback — called by the <script> tag loaded at startup */
-function _onLiveData(response) {
   try {
-    const liveData = parseGvizToStudentData(response);
-    if (liveData) {
+    const resp = await fetch('portfolio_folder_data.json');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const payload = await resp.json();
+
+    const liveData = payload.classes;
+    if (liveData && Object.keys(liveData).length > 0) {
       Object.keys(STUDENT_DATA).forEach(k => delete STUDENT_DATA[k]);
       Object.assign(STUDENT_DATA, liveData);
       _liveDataLoaded = true;
+      // Update data date from the JSON
+      if (payload.data_as_of) {
+        DATA_AS_OF = payload.data_as_of;
+      }
     }
   } catch (e) {
-    console.warn('Failed to parse live data:', e);
+    console.warn('Live data fetch failed, using baked-in:', e);
   }
-  // Now that data is (possibly) updated, initialize the UI
-  _finishStartup();
-}
-
-function _onLiveDataFailed() {
-  // Script load failed — use baked-in data
   _finishStartup();
 }
 
@@ -2509,25 +2459,8 @@ function _finishStartup() {
    SECTION 12: STARTUP
    ============================================================== */
 
-if (PUBLISHED_CSV_URL && window.location.protocol !== 'file:') {
-  // Load live data via JSONP — the gviz endpoint wraps data in a callback.
-  // Only works over http/https — Chrome blocks cross-origin loads from file://.
-  const script = document.createElement('script');
-  script.src = PUBLISHED_CSV_URL;
-  script.onerror = _onLiveDataFailed;
-  const _jsonpTimeout = setTimeout(() => {
-    if (!_liveDataLoaded) _onLiveDataFailed();
-  }, 8000);
-  const _handleLiveData = _onLiveData;
-  window._onLiveData = function(resp) {
-    clearTimeout(_jsonpTimeout);
-    _handleLiveData(resp);
-  };
-  document.head.appendChild(script);
-} else {
-  // No live URL or running from file:// — use baked-in data immediately
-  _finishStartup();
-}
+// Fetch live data from portfolio_folder_data.json (GitHub Pages) or use baked-in data
+_fetchLiveData();
 </script>
 </body>
 </html>
